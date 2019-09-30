@@ -45,6 +45,7 @@
 #include "cipher.h"
 #include "cert-private.h"
 #include "missing.h"
+#include "pem-private.h"
 
 #define PEM_START_BOUNDARY	"-----BEGIN "
 #define PEM_END_BOUNDARY	"-----END "
@@ -126,15 +127,15 @@ static bool is_end_boundary(const void *buf, size_t buf_len,
 	return true;
 }
 
-static uint8_t *pem_load_buffer(const void *buf, size_t buf_len,
-				char **type_label, size_t *len,
-				const uint8_t **endp)
+const char *pem_next(const void *buf, size_t buf_len, char **type_label,
+				size_t *len, size_t *base64_len,
+				const char **endp, bool strict)
 {
 	const char *buf_ptr = buf;
 	const char *base64_data = NULL, *eol;
 	const char *label = NULL;
-	uint8_t *data;
 	size_t label_len = 0;
+	const char *start = NULL;
 
 	/*
 	 * The base64 parser uses the RFC7468 laxbase64text grammar but we
@@ -148,26 +149,28 @@ static uint8_t *pem_load_buffer(const void *buf, size_t buf_len,
 				break;
 
 		if (!base64_data) {
-			label = is_start_boundary(buf, eol - buf_ptr,
+			label = is_start_boundary(buf_ptr, eol - buf_ptr,
 							&label_len);
-
-			if (label)
+			if (label) {
+				start = label - strlen("-----BEGIN ");
 				base64_data = eol;
-		} else if (is_end_boundary(buf_ptr, eol - buf_ptr, label,
-							label_len)) {
-			data = l_base64_decode(
-					(const char *) base64_data,
-					buf_ptr - base64_data, len);
-			if (!data)
-				return NULL;
+			} else if (strict)
+				break;
+		} else if (start && is_end_boundary(buf_ptr, eol - buf_ptr,
+							label, label_len)) {
+			if (len)
+				*len = eol - start + 1;
 
-			*type_label = l_strndup((const char *) label,
-							label_len);
+			if (type_label)
+				*type_label = l_strndup(label, label_len);
+
+			if (base64_len)
+				*base64_len = buf_ptr - base64_data - 1;
 
 			if (endp)
-				*endp = (uint8_t *)eol + 1;
+				*endp = eol + 1;
 
-			return data;
+			return base64_data;
 		}
 
 		if (eol == buf_ptr + buf_len)
@@ -189,10 +192,24 @@ static uint8_t *pem_load_buffer(const void *buf, size_t buf_len,
 	return NULL;
 }
 
+static uint8_t *pem_load_buffer(const void *buf, size_t buf_len,
+				char **type_label, size_t *len)
+{
+	size_t base64_len;
+	const char *base64;
+
+	base64 = pem_next(buf, buf_len, type_label, NULL, &base64_len,
+				NULL, false);
+	if (!base64)
+		return NULL;
+
+	return l_base64_decode(base64, base64_len, len);
+}
+
 LIB_EXPORT uint8_t *l_pem_load_buffer(const void *buf, size_t buf_len,
 					char **type_label, size_t *out_len)
 {
-	return pem_load_buffer(buf, buf_len, type_label, out_len, NULL);
+	return pem_load_buffer(buf, buf_len, type_label, out_len);
 }
 
 struct pem_file_info {
@@ -242,7 +259,7 @@ LIB_EXPORT uint8_t *l_pem_load_file(const char *filename,
 		return NULL;
 
 	result = pem_load_buffer(file.data, file.st.st_size,
-					type_label, len, NULL);
+					type_label, len);
 	pem_file_close(&file);
 	return result;
 }
@@ -288,7 +305,7 @@ LIB_EXPORT struct l_certchain *l_pem_load_certificate_chain(
 LIB_EXPORT struct l_queue *l_pem_load_certificate_list_from_data(
 						const void *buf, size_t len)
 {
-	const uint8_t *ptr, *end;
+	const char *ptr, *end;
 	struct l_queue *list = NULL;
 
 	ptr = buf;
@@ -297,10 +314,22 @@ LIB_EXPORT struct l_queue *l_pem_load_certificate_list_from_data(
 	while (ptr && ptr < end) {
 		uint8_t *der;
 		size_t der_len;
-		char *label;
+		char *label = NULL;
 		struct l_cert *cert;
+		size_t out_len = 0;
+		const char *base64;
+		size_t base64_len;
 
-		der = pem_load_buffer(ptr, end - ptr, &label, &der_len, &ptr);
+		base64 = pem_next(ptr, len, &label, &out_len, &base64_len,
+					&ptr, false);
+		/* if ptr is set but we got NULL, this was a parse error */
+		if (!base64 && ptr)
+			goto error;
+
+		if (!base64)
+			break;
+
+		der = l_base64_decode(base64, base64_len, &der_len);
 
 		if (!der || strcmp(label, "CERTIFICATE")) {
 			if (der)
@@ -470,7 +499,7 @@ LIB_EXPORT struct l_key *l_pem_load_private_key_from_data(const void *buf,
 	if (encrypted)
 		*encrypted = false;
 
-	content = pem_load_buffer(buf, buf_len, &label, &len, NULL);
+	content = pem_load_buffer(buf, buf_len, &label, &len);
 
 	if (!content)
 		return NULL;
